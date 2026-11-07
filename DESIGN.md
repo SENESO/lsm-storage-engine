@@ -153,7 +153,21 @@ Policy: size-tiered in spirit — tables accumulate as a tier of flush outputs,
 and the merge is a **full merge of every live table** into one, rather than a
 leveled design's incremental merges. That trades write amplification (every
 compaction rewrites all data) for a much simpler correctness story, which is
-the right trade at this scale. During the merge:
+the right trade at this scale.
+
+The merge **streams end to end**: a k-way merge holds one entry per input
+table, and each surviving entry is written straight into the output table
+through a buffered writer before the next is read. Nothing materializes the
+merged data in memory. Peak merge memory is one entry per input table, plus
+the output writer's sampled index (one key per `IndexSampleInterval` entries)
+and its bloom filter — proportional to the *key count*, never to the number of
+bytes the tables hold. (The one place a count is needed before the data is
+seen is the bloom filter's size; it is sized from the inputs' combined entry
+count, a strict upper bound on the merged count, since duplicates and
+tombstones only shrink it. A merged table may therefore carry a somewhat
+larger filter than an exact count would give — never a smaller one.)
+
+During the merge:
 
 * for duplicate keys, the newest table's version wins;
 * overwritten entries are dropped;
@@ -162,6 +176,18 @@ the right trade at this scale. During the merge:
   to shadow. (The memtable is newer than every table and is not part of the
   merge.) In a leveled design, tombstones may only be dropped at the last
   level; here every merge is a last-level merge.
+
+Evidence for the streaming bound, measured in the hardening run (shared
+sandbox VM, Release build, warm page cache — indicative, like the README
+benchmarks): 81 input tables totalling 75.8 MB merged into a single 60.9 MB
+table in ~0.3–0.4 s, with peak process working-set growth of 5–9 MB sampled
+every 2 ms across the merge. The suite's boundedness test replays that shape
+and asserts growth under 32 MB — under half the surviving data size, which
+is what a materializing merge would have to hold. Correctness at scale is
+evidenced separately: 300,000 keys through ~450,000 mixed writes (fill,
+delete-every-7th, rewrite-every-3rd, resurrect-half-the-deleted) across ~18
+tables, verified byte-for-byte against an independent in-test model after
+compaction, and again after a close/reopen cycle.
 
 Crash safety: the merged table is written to a temp file, fsynced, renamed,
 and only then swapped into the manifest. A crash before the swap leaves the
@@ -207,21 +233,92 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
 * A clean `Dispose()` fsyncs, so a dispose/reopen cycle loses nothing under
   either policy.
 * Deletes are writes: a tombstone is as durable as the value it removes.
+* One platform-qualified edge stands next to this list, stated in full under
+  *Deviations*: fsync makes a record's **bytes** durable; the **directory
+  entry** naming its file follows the filesystem's metadata rules. On NTFS,
+  on APFS, and on Linux journaling filesystems in their default modes,
+  created and renamed entries are durable as journaled metadata, and the
+  tables above hold exactly as written. On a non-journaling POSIX
+  filesystem, a power loss can in theory revert a create/rename from a
+  flush window — the one gap between this statement and full POSIX-grade
+  durability, named rather than hidden.
 
 ## Deviations from a textbook LSM, on purpose
 
-* **No immutable-memtable queue.** Textbook designs rotate the memtable to an
-  immutable one and flush it on a background thread so writes never stall.
-  Here the flush happens synchronously under the write lock. With a 4 MB
-  default memtable the stall is a few milliseconds, and in exchange an entire
-  class of races (flush failing in the background, reads spanning three
-  memtable generations, WAL generation bookkeeping across rotations) does not
-  exist. Read order is simply: memtable, then tables.
+* **No immutable-memtable queue (background flush — evaluated, not adopted).**
+  Textbook designs rotate the memtable to an immutable one and flush it on a
+  background thread so writes never stall. Here the flush happens
+  synchronously under the write lock. With a 4 MB default memtable the stall
+  is a few milliseconds, and in exchange an entire class of races (flush
+  failing in the background, reads spanning three memtable generations, WAL
+  generation bookkeeping across rotations) does not exist. Read order is
+  simply: memtable, then tables.
+
+  This was re-evaluated in the hardening pass, and the evaluation is recorded
+  here because it is a decision, not an oversight. Rotation forces the live
+  WAL to switch to a new generation *immediately* — new writes cannot wait
+  for the background flush — while the rotated generation's records are not
+  yet durable anywhere but that generation's WAL file. So for the whole
+  duration of a background flush, **two** WAL generations are live, and a
+  crash must replay both, in order. The manifest names exactly one live
+  generation, and the flush protocol's crash windows (above) are all stated
+  against that fact: with a single-generation manifest, recovery from a
+  mid-rotation crash would treat one of the two live generations as an
+  orphan and delete it — losing acknowledged writes, or resurrecting flushed
+  ones. A safe background flush therefore needs a manifest format change
+  first (a generation list plus a pending-flush table slot) and a new
+  recovery matrix for the states it creates. Two further obstacles stand
+  behind that one: a background flush can fail (disk full, I/O error) with
+  no caller to throw to — every write it covers was already acknowledged
+  against the WAL — so the engine would need a poisoned-state semantic the
+  current contract does not have; and clean shutdown and the crash test hook
+  would both have to rendezvous with the flush thread, so a flush completing
+  concurrently could not swap tables or save the manifest into an instance
+  that is already logically dead. The benefit on offer — removing a
+  few-millisecond stall at the default memtable size — does not pay for
+  re-opening the recovery proof. The prerequisite for any future attempt is
+  named: the manifest format change, with its own crash-state tests written
+  before the rotation itself.
 * **Full-merge compaction** instead of leveled compaction (see above).
-* **Directory fsyncs are not issued** after renames; file fsyncs are. On a
-  power loss, an OS could in theory lose a rename itself. This is the one gap
-  between "process-crash-proof + record-level power-loss-proof" and full
-  POSIX-grade durability theatre, and it is named rather than hidden.
+* **Directory fsyncs are not issued** after renames or file creations; file
+  fsyncs are. The distinction matters: fsyncing a record makes its *bytes*
+  durable, while the *name* — the directory entry a WAL file is created
+  under, an SSTable is renamed to, the manifest is renamed over — becomes
+  durable under POSIX only when the containing directory is itself fsynced.
+  .NET exposes no managed API for that: `FileStream` and `File.OpenHandle`
+  refuse directory paths outright (verified empirically on .NET 8, Linux —
+  both throw `UnauthorizedAccessException`), and Windows has no equivalent
+  call in the managed surface either. The only route would be native interop
+  (libc `open`/`fsync` on Unix; `CreateFile` with backup-semantics plus
+  `FlushFileBuffers` on Windows) — per-platform native code in a library
+  whose single dependency rule is "none". The gap is therefore closed by
+  statement instead of by code, precisely:
+
+  *What it can reach:* only the instants where a name is created or replaced
+  — a WAL file appearing at open or at a flush's generation switch, an
+  SSTable's rename at flush or compaction, the MANIFEST rename that follows.
+  If the OS kept the paired deletion (of the previous WAL generation) but
+  lost the rename, that flush's acknowledged writes could go with it: the
+  newest manifest reads as absent, the new table is an orphan, the old log
+  is gone. Record-level fsync operates below the file-name abstraction and
+  cannot see this.
+
+  *What it cannot reach:* the bytes of any file whose name is already
+  durable. A database that has sat through one completed flush cycle has all
+  its names settled, and every guarantee in the tables above then holds in
+  full.
+
+  *Per platform:* on Windows/NTFS the exposure is effectively absent —
+  NTFS journals metadata, so a create or rename that has returned survives
+  power loss; that is precisely why no directory-sync call exists for .NET
+  to expose. macOS/APFS journals metadata the same way. On Linux, ext4 in
+  its default `ordered` mode, XFS, and Btrfs all journal metadata, making
+  the same outcome de-facto reliable — but POSIX does not *guarantee* it
+  without the directory fsync, and a non-journaling filesystem (or a
+  journal-disabled mount) is genuinely exposed. An embedder who needs the
+  guarantee on such a filesystem today has one lever: place the database
+  directory on a journaling filesystem, which is the default on mainstream
+  Linux distributions.
 
 ## Limitations
 
@@ -229,7 +326,9 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
 * No transactions beyond single-batch atomicity (no read-your-writes isolation
   levels, no multi-batch rollback).
 * Single writer process; no network interface — this is an embeddable library.
-* Compaction buffers its merged output in memory before writing the new table;
-  at very large data sizes a streaming merge writer would be the next step.
+* Compaction streams (see above), but it is still a *full* merge: every
+  compaction rewrites every live byte, so write amplification — not memory —
+  is the cost that grows with data size. A leveled design is the named next
+  step if that ever matters more than the simple correctness story.
 * Values are returned as copies from `Get`; `Put` takes ownership of the
   arrays it is given (mutating them afterwards is a caller bug).

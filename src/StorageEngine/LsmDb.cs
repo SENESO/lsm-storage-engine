@@ -435,16 +435,49 @@ public sealed class LsmDb : IDisposable
         // A compaction here always spans EVERY table, so there is no older data
         // beneath the merge for a tombstone to shadow: tombstones are purged,
         // and overwritten copies collapse to the newest value.
-        var merged = new List<KeyValuePair<byte[], byte[]>>();
-        foreach (var entry in MergeHelper.MergeByRecency(sources))
+        //
+        // The merge streams end to end. MergeByRecency holds one entry per
+        // input table in its queue; each surviving entry is written straight
+        // into the output table before the next is read. No merged copy of the
+        // data is ever held in memory: peak merge memory is one entry per
+        // input, plus the writer's sampled index (one key per
+        // IndexSampleInterval entries) and its bloom filter — proportional to
+        // the key count, never to the number of bytes the tables hold.
+        //
+        // A bloom filter must be sized before the first key is added, and the
+        // one count known at that point is the inputs' combined entry count —
+        // a strict upper bound on the merged count, since duplicates and
+        // tombstones only shrink it. The merged table can therefore carry a
+        // larger filter than an exact count would give, never a smaller one.
+        long inputEntries = 0;
+        foreach (var table in _tables)
+            inputEntries += table.EntryCount;
+        var bloomBound = inputEntries > int.MaxValue ? int.MaxValue : (int)inputEntries;
+
+        var id = _manifest.NextSstId;
+        var tempPath = Path.Combine(_directory, SSTable.TempFileName(id));
+        var finalPath = Path.Combine(_directory, SSTable.FileName(id));
+        long written = 0;
+        using (var writer = new SSTable.Writer(tempPath, _options, Math.Max(bloomBound, 1)))
         {
-            if (entry.Value is not null)
-                merged.Add(new KeyValuePair<byte[], byte[]>(entry.Key, entry.Value));
+            foreach (var entry in MergeHelper.MergeByRecency(sources))
+            {
+                if (entry.Value is null)
+                    continue; // tombstone: purged by the full merge (see above)
+                writer.Add(entry.Key, entry.Value);
+                written++;
+            }
+            if (written > 0)
+                writer.Finish();
         }
 
         var retired = _tables;
-        if (merged.Count == 0)
+        if (written == 0)
         {
+            // Every input entry was a tombstone or a shadowed copy: the merged
+            // result is empty. No table is created and no table id is consumed
+            // — the (empty) temp file is simply discarded.
+            TryDeleteFile(tempPath);
             _manifest.SstIds.Clear();
             _manifest.Save(_directory);
             _tables = new List<SSTable.Reader>();
@@ -452,15 +485,6 @@ public sealed class LsmDb : IDisposable
             return;
         }
 
-        var id = _manifest.NextSstId;
-        var tempPath = Path.Combine(_directory, SSTable.TempFileName(id));
-        var finalPath = Path.Combine(_directory, SSTable.FileName(id));
-        using (var writer = new SSTable.Writer(tempPath, _options, merged.Count))
-        {
-            foreach (var (key, value) in merged)
-                writer.Add(key, value);
-            writer.Finish();
-        }
         File.Move(tempPath, finalPath);
 
         _manifest.SstIds.Clear();

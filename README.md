@@ -23,7 +23,7 @@ A storage engine is where backend engineering stops being forgiving:
 - Append-only WAL; every record framed with its length and CRC-32
 - Memtable flush to immutable SSTables at a configurable size threshold
 - SSTables with sparse indexes and per-table bloom filters
-- Full-merge compaction at a configurable table-count threshold: newest version wins, tombstones purged
+- Full-merge compaction at a configurable table-count threshold: newest version wins, tombstones purged — streamed end to end, so peak merge memory is proportional to the key count, never to the number of bytes merged
 - Atomic manifest (temp file + fsync + rename) as the single source of truth for live files; orphans from interrupted operations are cleaned on open
 - One open database per directory, enforced by an OS file lock; concurrent readers inside the process
 
@@ -73,6 +73,9 @@ Measured with the included `bench` project (single thread, 100-byte values, rand
 | Point reads @ 10,000 keys (50,000 reads) | ~101,000 reads/sec |
 | Point reads @ 100,000 keys (50,000 reads) | ~66,600 reads/sec |
 | Full scan @ 100,000 keys | ~431,000 entries/sec |
+| Streaming compaction: 81 tables, 75.8 MB → one 60.9 MB table | ~0.3–0.4 sec, peak working-set growth 5–9 MB |
+
+The compaction line is the hardening pass's boundedness evidence: the merge streams, so its memory stays in single-digit megabytes while the data it merges is ~76 MB — the test suite asserts growth under 32 MB on the same shape (a merge that materialized its output would need roughly the surviving ~61 MB). The suite also carries a scale check: 300,000 keys through ~450,000 mixed writes, verified byte-for-byte against an independent model after compaction and again after reopen.
 
 Run them yourself:
 
@@ -82,7 +85,7 @@ dotnet run --project bench/StorageEngine.Bench -c Release
 
 ## Tests
 
-59 tests, including the ones that matter most — **crash simulation**: write, abandon the instance without any clean shutdown (a test hook drops every handle the way process death does), reopen, and verify every acknowledged write is present and no partial record is visible. Plus torn-tail tests (garbage appended to the WAL, a CRC-damaged final record, and a record cut mid-payload all recover cleanly and are truncated), a mid-log corruption test (one flipped byte with valid records after it → loud `StorageCorruptionException`), tests that rebuild the exact on-disk states a crash leaves mid-flush and mid-compaction (orphaned tables are deleted unread; retired compaction inputs are cleaned on reopen), compaction correctness checked byte-for-byte against a model, write semantics across layers (duplicate keys inside one batch, delete-then-reinsert across flushes, compaction against a live memtable, values far larger than the memtable), scan snapshot and range edges, argument validation, and bloom-filter sanity (no false negatives ever; false-positive rate under a stated ceiling).
+61 tests, including the ones that matter most — **crash simulation**: write, abandon the instance without any clean shutdown (a test hook drops every handle the way process death does), reopen, and verify every acknowledged write is present and no partial record is visible. Plus torn-tail tests (garbage appended to the WAL, a CRC-damaged final record, and a record cut mid-payload all recover cleanly and are truncated), a mid-log corruption test (one flipped byte with valid records after it → loud `StorageCorruptionException`), tests that rebuild the exact on-disk states a crash leaves mid-flush and mid-compaction (orphaned tables are deleted unread; retired compaction inputs are cleaned on reopen), compaction correctness checked byte-for-byte against a model, write semantics across layers (duplicate keys inside one batch, delete-then-reinsert across flushes, compaction against a live memtable, values far larger than the memtable), scan snapshot and range edges, argument validation, and bloom-filter sanity (no false negatives ever; false-positive rate under a stated ceiling). The hardening pass added the two scale proofs: a **boundedness test** that compacts ~76 MB of tables while a sampler thread watches the process working set (the streaming merge must stay under a 32 MB growth limit — see Benchmarks), and a **300,000-key scale test** (mixed puts, deletes, rewrites, and resurrections across ~18 tables) verified byte-for-byte against an independent model after a full compaction and again after reopen.
 
 ```bash
 dotnet test -c Release
@@ -90,7 +93,7 @@ dotnet test -c Release
 
 ## Limitations
 
-Single writer process per directory; no transactions beyond batch atomicity; no TTL or custom comparators; compaction buffers its merged output in memory. Directory fsyncs after renames are not issued (file fsyncs are) — see the *Guarantees* and *Deviations* sections of [DESIGN.md](DESIGN.md) for exactly what that means.
+Single writer process per directory; no transactions beyond batch atomicity; no TTL or custom comparators; compaction is a full merge, so its write amplification (not its memory) grows with data size. Directory fsyncs after renames are not issued (file fsyncs are): on journaling filesystems — NTFS, APFS, and ext4/XFS/Btrfs in their default modes — created and renamed entries are durable as journaled metadata, while a non-journaling POSIX filesystem leaves a theoretical power-loss window around renames. See the *Guarantees* and *Deviations* sections of [DESIGN.md](DESIGN.md) for the precise per-platform statement.
 
 ## License
 
