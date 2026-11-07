@@ -31,6 +31,38 @@ public sealed class LsmDb : IDisposable
     private bool _disposed;
     private bool _crashed;
 
+    // Background flush state. While a flush is in flight, the frozen memtable
+    // being written out is _pendingMemtable (newer than every table, older
+    // than _memtable) and _pendingFlush is its job record. Both are guarded
+    // by _rw like the rest of the state; the job's Done event is what
+    // lock-free waiters (Flush, Compact, TableCount, Dispose) rendezvous on.
+    private Memtable? _pendingMemtable;
+    private FlushJob? _pendingFlush;
+    private bool _flushRequested;
+    private Exception? _flushFailure;
+
+    // Test hooks, invoked on the background flush thread. They let the suite
+    // hold a flush at an exact point (deterministic crash states) and inject
+    // an I/O failure. Null in production use.
+    internal Action? FlushJobStartingHook;
+    internal Action? FlushTableWrittenHook;
+    internal Action? FlushFailureHook;
+
+    /// <summary>One in-flight background flush: a sealed WAL generation being written into its reserved table.</summary>
+    private sealed class FlushJob
+    {
+        public required long Generation { get; init; }
+        public required long TableId { get; init; }
+        public required IReadOnlyList<KeyValuePair<byte[], byte[]?>> Entries { get; init; }
+        public ManualResetEventSlim Done { get; } = new(false);
+
+        /// <summary>Set when the job failed; written before <see cref="Done"/> is set.</summary>
+        public Exception? Error;
+
+        /// <summary>Set by SimulateCrash: the worker abandons the job at its next checkpoint, touching nothing.</summary>
+        public bool Abandoned;
+    }
+
     private LsmDb(StorageOptions options, string directory, FileStream lockStream, Manifest manifest,
         List<SSTable.Reader> tables, Memtable memtable, WriteAheadLog wal)
     {
@@ -68,9 +100,25 @@ public sealed class LsmDb : IDisposable
                 $"The database directory '{directory}' is already open by another LsmDb instance.", ex);
         }
 
+        var manifestFileExists = File.Exists(Path.Combine(directory, Manifest.FileName));
         try
         {
             var manifest = Manifest.Load(directory);
+
+            // A WAL generation the manifest names is the only durable copy of
+            // its records until a flush commits them into a table. Its file
+            // missing is the same class of damage as a missing table: loud,
+            // never an empty replay that loses acknowledged writes quietly.
+            if (manifestFileExists)
+            {
+                foreach (var generation in manifest.WalGenerations)
+                {
+                    if (!File.Exists(WalPath(directory, generation)))
+                        throw new StorageCorruptionException(
+                            $"The manifest lists WAL generation {generation}, but '{WalPath(directory, generation)}' is missing. The directory was damaged outside the engine.");
+                }
+            }
+
             CleanupOrphanFiles(directory, manifest);
 
             var tables = new List<SSTable.Reader>();
@@ -84,25 +132,44 @@ public sealed class LsmDb : IDisposable
             }
             tables.Sort((a, b) => a.Id.CompareTo(b.Id));
 
-            // Replay the WAL into a fresh memtable. Records already reflected
-            // in a manifest-listed table never share a WAL generation with the
-            // table (see Flush), so replay cannot double-apply a flush.
+            // Replay every live WAL generation, oldest first, into a fresh
+            // memtable. A generation leaves the manifest's list only at the
+            // commit that lands its records in a manifest table, so replay
+            // never double-applies a committed flush. A pending flush (see
+            // Manifest) is resolved here by discarding it: its generation is
+            // replayed like any other, and its reserved table file — never
+            // adopted by the manifest — was already removed above as an
+            // orphan. The WAL, not the half-landed table, is the record.
             var memtable = new Memtable();
-            var walPath = WalPath(directory, manifest.WalGeneration);
-            var validLength = WalRecovery.Replay(walPath, payload =>
+            foreach (var generation in manifest.WalGenerations)
             {
-                foreach (var op in RecordCodec.Decode(payload))
-                    memtable.Put(op.Key, op.Value);
-            });
-            if (File.Exists(walPath) && new FileInfo(walPath).Length > validLength)
-            {
-                // Torn tail: cut the log back to the last valid record.
-                using var stream = new FileStream(walPath, FileMode.Open, FileAccess.Write, FileShare.None);
-                stream.SetLength(validLength);
-                stream.Flush(flushToDisk: true);
+                var generationPath = WalPath(directory, generation);
+                var validLength = WalRecovery.Replay(generationPath, payload =>
+                {
+                    foreach (var op in RecordCodec.Decode(payload))
+                        memtable.Put(op.Key, op.Value);
+                });
+                if (File.Exists(generationPath) && new FileInfo(generationPath).Length > validLength)
+                {
+                    // Torn tail: cut the log back to the last valid record.
+                    using var stream = new FileStream(generationPath, FileMode.Open, FileAccess.Write, FileShare.None);
+                    stream.SetLength(validLength);
+                    stream.Flush(flushToDisk: true);
+                }
             }
 
+            var walPath = WalPath(directory, manifest.WalGeneration);
             var wal = WriteAheadLog.OpenForAppend(walPath, options.FsyncPolicy, options.FsyncIntervalMilliseconds);
+
+            // Make recovery resolutions durable: a v1 manifest is upgraded
+            // in place, and a discarded pending flush is cleared, the first
+            // time the directory opens cleanly.
+            if (manifest.LoadedAsVersion1 || manifest.PendingFlush is not null)
+            {
+                manifest.PendingFlush = null;
+                manifest.Save(directory);
+            }
+
             return new LsmDb(options, directory, lockStream, manifest, tables, memtable, wal);
         }
         catch
@@ -138,6 +205,7 @@ public sealed class LsmDb : IDisposable
         try
         {
             ThrowIfUnavailable();
+            ThrowIfFlushFailed();
             _wal.Append(RecordCodec.EncodePut(key, value));
             _memtable.Put(key, value);
             FlushIfNeededLocked();
@@ -159,6 +227,7 @@ public sealed class LsmDb : IDisposable
         try
         {
             ThrowIfUnavailable();
+            ThrowIfFlushFailed();
             if (GetInternal(key) is null)
                 return false;
             _wal.Append(RecordCodec.EncodeDelete(key));
@@ -185,6 +254,7 @@ public sealed class LsmDb : IDisposable
         try
         {
             ThrowIfUnavailable();
+            ThrowIfFlushFailed();
             _wal.Append(RecordCodec.EncodeBatch(batch.Ops));
             foreach (var op in batch.Ops)
                 _memtable.Put(op.Key, op.Value);
@@ -211,6 +281,8 @@ public sealed class LsmDb : IDisposable
         {
             ThrowIfUnavailable();
             sources = new List<IEnumerable<KeyValuePair<byte[], byte[]?>>> { _memtable.SnapshotEntries() };
+            if (_pendingMemtable is not null)
+                sources.Add(_pendingMemtable.SnapshotEntries());
             for (var i = _tables.Count - 1; i >= 0; i--)
                 sources.Add(_tables[i].EnumerateAll());
         }
@@ -221,32 +293,86 @@ public sealed class LsmDb : IDisposable
         return ScanView(sources, fromInclusive, toExclusive);
     }
 
-    /// <summary>Flushes the memtable to an SSTable now (a no-op when the memtable is empty).</summary>
+    /// <summary>
+    /// Flushes the memtable to an SSTable. The rotation itself is instant
+    /// (the memtable is sealed and a new one takes over; the table is then
+    /// written by a background thread), and this call waits until the flush
+    /// — and any flush already in flight ahead of it — has committed, so on
+    /// return everything written so far is in a table. When a previous
+    /// background flush has failed, this call retries it. A no-op when the
+    /// memtable is empty and no flush is in flight.
+    /// </summary>
     public void Flush()
     {
         _rw.EnterWriteLock();
         try
         {
             ThrowIfUnavailable();
-            FlushLocked();
+            if (_flushFailure is not null)
+            {
+                // Retry the failed job: same generation, same reserved
+                // table id, same frozen entries. The durable state never
+                // changed, so the retry starts from an identical position.
+                var failed = _pendingFlush!;
+                _flushFailure = null;
+                _pendingFlush = StartFlushJob(failed.Generation, failed.TableId, failed.Entries);
+            }
+            else if (_pendingFlush is null)
+            {
+                if (_memtable.Count > 0)
+                    RotateLocked();
+            }
+            else
+            {
+                // A flush is already running; ask its commit to rotate the
+                // current memtable next, and wait for that job too.
+                _flushRequested = true;
+            }
         }
         finally
         {
             _rw.ExitWriteLock();
+        }
+
+        WaitForFlushToSettle();
+
+        _rw.EnterReadLock();
+        try
+        {
+            ThrowIfFlushFailed();
+        }
+        finally
+        {
+            _rw.ExitReadLock();
         }
     }
 
     /// <summary>
     /// Merges every SSTable into one, dropping overwritten values and purging
     /// all tombstones. Safe to call at any time; reads and in-flight snapshot
-    /// scans are unaffected (retired files are removed lazily).
+    /// scans are unaffected (retired files are removed lazily). When a
+    /// background flush is in flight it is awaited first, so the merge spans
+    /// every table flushed so far.
     /// </summary>
     public void Compact()
     {
+        _rw.EnterReadLock();
+        try
+        {
+            ThrowIfUnavailable();
+        }
+        finally
+        {
+            _rw.ExitReadLock();
+        }
+
+        WaitForFlushToSettle();
+
         _rw.EnterWriteLock();
         try
         {
             ThrowIfUnavailable();
+            ThrowIfFlushFailed();
             CompactLocked();
         }
         finally
@@ -255,11 +381,17 @@ public sealed class LsmDb : IDisposable
         }
     }
 
-    /// <summary>The number of live SSTables.</summary>
+    /// <summary>
+    /// The number of live SSTables. When a background flush is in flight
+    /// this waits for the flush pipeline to settle, so the count is the
+    /// committed count, never a mid-flight guess. Reads and writes do not
+    /// wait — only this observation point does.
+    /// </summary>
     public int TableCount
     {
         get
         {
+            WaitForFlushToSettle();
             _rw.EnterReadLock();
             try
             {
@@ -290,20 +422,41 @@ public sealed class LsmDb : IDisposable
     }
 
     /// <summary>
-    /// Clean shutdown: a final WAL fsync, then all files are released. Data is
-    /// not flushed to an SSTable — the WAL is the record, and the next
-    /// <see cref="Open"/> replays it.
+    /// Clean shutdown: rendezvous with any in-flight background flush (it
+    /// commits normally), a final WAL fsync, then all files are released.
+    /// Unflushed data is not forced to an SSTable — the WAL is the record,
+    /// and the next <see cref="Open"/> replays it.
     /// </summary>
     public void Dispose()
     {
         if (_crashed)
             return; // SimulateCrash already dropped every handle.
+
+        FlushJob? job;
         _rw.EnterWriteLock();
         try
         {
             if (_disposed)
                 return;
             _disposed = true;
+            job = _pendingFlush;
+        }
+        finally
+        {
+            _rw.ExitWriteLock();
+        }
+
+        // Rendezvous with the background flush, holding no lock: the
+        // in-flight job commits normally (the disposed flag suppresses only
+        // chaining a further rotation), so the directory is left in the
+        // committed state rather than a half-rotated one, and teardown
+        // below can never race the worker's manifest save or file moves.
+        // The wait is bounded by the flush itself — one table write.
+        job?.Done.Wait();
+
+        _rw.EnterWriteLock();
+        try
+        {
             _wal.Dispose();
             foreach (var table in _tables)
                 table.Dispose();
@@ -334,6 +487,12 @@ public sealed class LsmDb : IDisposable
             if (_disposed || _crashed)
                 return;
             _crashed = true;
+            // Process death does not wait for the flush thread: the job is
+            // abandoned, and the worker's checkpoints keep it from touching
+            // the directory again. Whatever state it froze mid-step is one
+            // of the manifest v2 crash states recovery resolves.
+            if (_pendingFlush is not null)
+                _pendingFlush.Abandoned = true;
             _wal.Abandon();
             foreach (var table in _tables)
                 table.Dispose();
@@ -350,6 +509,8 @@ public sealed class LsmDb : IDisposable
     private byte[]? GetInternal(byte[] key)
     {
         if (_memtable.TryGet(key, out var value))
+            return value;
+        if (_pendingMemtable is not null && _pendingMemtable.TryGet(key, out value))
             return value;
         for (var i = _tables.Count - 1; i >= 0; i--)
         {
@@ -376,51 +537,275 @@ public sealed class LsmDb : IDisposable
 
     private void FlushIfNeededLocked()
     {
-        if (_memtable.SizeBytes >= _options.MemTableSizeBytes)
-            FlushLocked();
+        // Rotation is cheap and never blocks on the worker: when a flush is
+        // already in flight the memtable simply keeps growing, and that
+        // flush's commit chains the next rotation itself.
+        if (_pendingFlush is null && _flushFailure is null &&
+            _memtable.SizeBytes >= _options.MemTableSizeBytes)
+            RotateLocked();
     }
 
-    private void FlushLocked()
+    /// <summary>
+    /// Seals the live memtable and its WAL generation and starts the
+    /// background flush. The write lock is held. The order of steps is the
+    /// crash-safety argument:
+    ///   1. The next WAL generation's file exists on disk BEFORE the
+    ///      manifest names it.
+    ///   2. The manifest commits the rotation atomically: the sealed
+    ///      generation stays listed and gains a pending-flush slot, the new
+    ///      generation becomes the append target. From this instant, a
+    ///      crash recovers by replaying both generations — the sealed one's
+    ///      records are durable in exactly its WAL until the flush commits.
+    ///   3. Only then does the in-memory state rotate (frozen memtable,
+    ///      fresh memtable, WAL handle switched) and the worker start.
+    /// </summary>
+    private void RotateLocked()
     {
-        if (_memtable.Count == 0)
-            return;
-
-        var entries = _memtable.SnapshotEntries();
-        var id = _manifest.NextSstId;
-        var tempPath = Path.Combine(_directory, SSTable.TempFileName(id));
-        var finalPath = Path.Combine(_directory, SSTable.FileName(id));
-        using (var writer = new SSTable.Writer(tempPath, _options, entries.Count))
-        {
-            foreach (var (key, value) in entries)
-                writer.Add(key, value);
-            writer.Finish();
-        }
-        File.Move(tempPath, finalPath);
-
-        // The next WAL generation must exist on disk BEFORE the manifest points
-        // at it; after the manifest moves, the old generation's records live in
-        // the new table and its file becomes an orphan.
-        var newGeneration = _manifest.WalGeneration + 1;
+        var generation = _manifest.WalGeneration;
+        var tableId = _manifest.NextSstId;
+        var newGeneration = generation + 1;
         var newWalPath = WalPath(_directory, newGeneration);
         using (var create = new FileStream(newWalPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             create.Flush(flushToDisk: true);
 
-        _manifest.SstIds.Add(id);
-        _manifest.NextSstId = id + 1;
-        _manifest.WalGeneration = newGeneration;
-        _manifest.Save(_directory);
+        _manifest.NextSstId = tableId + 1;
+        _manifest.WalGenerations.Add(newGeneration);
+        _manifest.PendingFlush = (generation, tableId);
+        try
+        {
+            _manifest.Save(_directory);
+        }
+        catch
+        {
+            // The rotation did not commit: roll the in-memory manifest back
+            // so the instance stays consistent with the file on disk.
+            _manifest.NextSstId = tableId;
+            _manifest.WalGenerations.Remove(newGeneration);
+            _manifest.PendingFlush = null;
+            TryDeleteFile(newWalPath);
+            throw;
+        }
 
-        var oldWal = _wal;
-        var oldWalPath = WalPath(_directory, newGeneration - 1);
-        _wal = WriteAheadLog.OpenForAppend(newWalPath, _options.FsyncPolicy, _options.FsyncIntervalMilliseconds);
-        oldWal.Dispose();
-        TryDeleteFile(oldWalPath);
-
-        _tables.Add(SSTable.Reader.Open(id, finalPath));
+        var job = StartFlushJob(generation, tableId, _memtable.SnapshotEntries());
+        _pendingMemtable = _memtable;
         _memtable = new Memtable();
 
-        if (_tables.Count >= _options.CompactionTableThreshold)
-            CompactLocked();
+        var oldWal = _wal;
+        _wal = WriteAheadLog.OpenForAppend(newWalPath, _options.FsyncPolicy, _options.FsyncIntervalMilliseconds);
+        oldWal.Dispose();
+    }
+
+    /// <summary>Creates a flush job for the sealed generation, installs it as the pending flush, and starts its worker thread.</summary>
+    private FlushJob StartFlushJob(long generation, long tableId,
+        IReadOnlyList<KeyValuePair<byte[], byte[]?>> entries)
+    {
+        var job = new FlushJob { Generation = generation, TableId = tableId, Entries = entries };
+        _pendingFlush = job;
+        var thread = new Thread(() => RunFlushJob(job))
+        {
+            IsBackground = true,
+            Name = "LsmDb background flush",
+        };
+        thread.Start();
+        return job;
+    }
+
+    /// <summary>
+    /// The background flush worker. The table write itself takes no locks:
+    /// it streams the frozen entries to the reserved temp file, fsyncs, and
+    /// renames. Only the commit (manifest swap, generation retirement)
+    /// takes the write lock, briefly. Abandon checkpoints bracket every
+    /// step that changes the directory, so a worker outliving a simulated
+    /// crash can never adopt, delete, or overwrite anything afterwards.
+    /// </summary>
+    private void RunFlushJob(FlushJob job)
+    {
+        var tempPath = Path.Combine(_directory, SSTable.TempFileName(job.TableId));
+        var finalPath = Path.Combine(_directory, SSTable.FileName(job.TableId));
+        try
+        {
+            FlushJobStartingHook?.Invoke();
+            FlushFailureHook?.Invoke(); // test-only fault injection
+
+            using (var writer = new SSTable.Writer(tempPath, _options, job.Entries.Count))
+            {
+                foreach (var (key, value) in job.Entries)
+                    writer.Add(key, value);
+                writer.Finish();
+            }
+
+            if (job.Abandoned)
+            {
+                TryDeleteFile(tempPath);
+                job.Done.Set();
+                return;
+            }
+
+            File.Move(tempPath, finalPath);
+
+            FlushTableWrittenHook?.Invoke();
+
+            if (job.Abandoned)
+            {
+                // Died after the rename: the table stays on disk unadopted.
+                // The next open removes it as an orphan and replays the
+                // generation's WAL — exactly the state the v2 recovery
+                // tests construct by hand.
+                job.Done.Set();
+                return;
+            }
+
+            CommitFlush(job, finalPath);
+        }
+        catch (Exception ex)
+        {
+            if (job.Abandoned)
+            {
+                job.Done.Set();
+                return;
+            }
+            FailFlush(job, ex);
+        }
+    }
+
+    /// <summary>
+    /// Lands a finished background flush. The write lock is taken briefly.
+    /// In one manifest save: the reserved table is adopted, the pending slot
+    /// clears, and every generation the flushed memtable covered (the sealed
+    /// one, plus any older generations recovery had replayed into the same
+    /// memtable) leaves the generation list — their records are in the table
+    /// now, and their files are deleted. Before the job reports completion,
+    /// a chained rotation is installed when one was requested or the live
+    /// memtable crossed its threshold again, so waiters never observe a
+    /// false idle pipeline.
+    /// </summary>
+    private void CommitFlush(FlushJob job, string finalPath)
+    {
+        _rw.EnterWriteLock();
+        try
+        {
+            if (job.Abandoned || _crashed)
+            {
+                job.Done.Set();
+                return;
+            }
+
+            var savedIds = _manifest.SstIds.ToList();
+            var savedGenerations = _manifest.WalGenerations.ToList();
+            List<long> retired;
+            try
+            {
+                retired = _manifest.WalGenerations.Where(g => g <= job.Generation).ToList();
+                _manifest.SstIds.Add(job.TableId);
+                _manifest.WalGenerations.RemoveAll(g => g <= job.Generation);
+                _manifest.PendingFlush = null;
+                _manifest.Save(_directory);
+            }
+            catch
+            {
+                _manifest.SstIds.Clear();
+                _manifest.SstIds.AddRange(savedIds);
+                _manifest.WalGenerations.Clear();
+                _manifest.WalGenerations.AddRange(savedGenerations);
+                _manifest.PendingFlush = (job.Generation, job.TableId);
+                throw;
+            }
+
+            _tables.Add(SSTable.Reader.Open(job.TableId, finalPath));
+            _pendingMemtable = null;
+
+            foreach (var generation in retired)
+                TryDeleteFile(WalPath(_directory, generation));
+
+            if (_tables.Count >= _options.CompactionTableThreshold)
+                CompactLocked();
+
+            try
+            {
+                if (!_disposed &&
+                    (_flushRequested || _memtable.SizeBytes >= _options.MemTableSizeBytes) &&
+                    _memtable.Count > 0)
+                {
+                    RotateLocked(); // installs the chained job as _pendingFlush
+                }
+                else
+                {
+                    _pendingFlush = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                // This job committed; only the chained rotation failed. The
+                // state on disk and in memory is consistent — the failure
+                // surfaces through the same channel as a flush failure.
+                _pendingFlush = null;
+                _flushFailure = ex;
+            }
+            _flushRequested = false;
+        }
+        finally
+        {
+            _rw.ExitWriteLock();
+        }
+        job.Done.Set();
+    }
+
+    /// <summary>
+    /// Records a background flush failure. The durable state is untouched:
+    /// the generation is still listed, the pending slot still set, its WAL
+    /// file intact, and the frozen memtable stays in the read path — reads
+    /// keep working. What changes is only that writes stop (they throw,
+    /// naming the failure) until <see cref="Flush"/> retries the job to
+    /// completion or the instance is disposed; a reopen recovers every
+    /// acknowledged write from the WALs either way. The generation is never
+    /// silently dropped.
+    /// </summary>
+    private void FailFlush(FlushJob job, Exception error)
+    {
+        _rw.EnterWriteLock();
+        try
+        {
+            if (job.Abandoned || _crashed)
+                return;
+            job.Error = error;
+            _flushFailure = error;
+            TryDeleteFile(Path.Combine(_directory, SSTable.TempFileName(job.TableId)));
+        }
+        finally
+        {
+            _rw.ExitWriteLock();
+            job.Done.Set();
+        }
+    }
+
+    /// <summary>
+    /// Waits until no background flush is in flight — including jobs chained
+    /// from a commit — or the in-flight job has failed (its caller surfaces
+    /// the failure). Takes no lock while waiting; the worker needs only the
+    /// write lock, briefly, so waiting can never deadlock it.
+    /// </summary>
+    private void WaitForFlushToSettle()
+    {
+        while (true)
+        {
+            FlushJob? job;
+            _rw.EnterReadLock();
+            try
+            {
+                if (_crashed)
+                    return;
+                job = _pendingFlush;
+            }
+            finally
+            {
+                _rw.ExitReadLock();
+            }
+            if (job is null)
+                return;
+            job.Done.Wait();
+            if (job.Error is not null)
+                return;
+        }
     }
 
     private void CompactLocked()
@@ -507,6 +892,22 @@ public sealed class LsmDb : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
+    /// <summary>
+    /// The write-side half of the background flush failure semantics (see
+    /// FailFlush): while a failed flush is outstanding, writes throw —
+    /// naming the original failure — instead of piling onto a pipeline
+    /// whose oldest generation cannot land. Reads are not gated: the frozen
+    /// memtable is intact and part of the read path.
+    /// </summary>
+    private void ThrowIfFlushFailed()
+    {
+        if (_flushFailure is not null)
+            throw new InvalidOperationException(
+                "A background flush failed, so writes are suspended: the generation it was flushing is " +
+                "still fully durable in its WAL and nothing was lost. Call Flush() to retry the flush, " +
+                "or Dispose and reopen.", _flushFailure);
+    }
+
     private static string WalPath(string directory, long generation) =>
         Path.Combine(directory, $"wal-{generation}.log");
 
@@ -532,7 +933,7 @@ public sealed class LsmDb : IDisposable
             }
             else if (name.StartsWith("wal-", StringComparison.Ordinal) &&
                      name.EndsWith(".log", StringComparison.Ordinal) &&
-                     TryParseId(name, out var walGen) && walGen != manifest.WalGeneration)
+                     TryParseId(name, out var walGen) && !manifest.WalGenerations.Contains(walGen))
             {
                 TryDeleteFile(file);
             }

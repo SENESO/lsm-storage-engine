@@ -42,15 +42,20 @@ internal sealed class WriteAheadLog : IDisposable
         if (payload.Length > MaxPayloadBytes)
             throw new ArgumentException($"Record payload of {payload.Length} bytes exceeds the {MaxPayloadBytes}-byte limit.", nameof(payload));
 
-        Span<byte> header = stackalloc byte[HeaderSize];
-        BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[4..], Crc32.Compute(payload));
+        // The frame is assembled whole and handed to the stream in ONE
+        // write. A record — in particular a batch, whose atomicity is the
+        // frame CRC — must never reach the OS as two pieces flushed at
+        // different moments: recovery's proof ("appends are sequential, so
+        // damage can only be a torn tail") is stated about whole records.
+        var frame = new byte[HeaderSize + payload.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(4), Crc32.Compute(payload));
+        payload.CopyTo(frame.AsSpan(HeaderSize));
 
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_closed, this);
-            _stream.Write(header);
-            _stream.Write(payload);
+            _stream.Write(frame);
             // The record is now with the OS. Flush(true) additionally forces it
             // to the physical device — that is the fsync policy decision.
             _stream.Flush(flushToDisk: _policy == FsyncPolicy.Always);

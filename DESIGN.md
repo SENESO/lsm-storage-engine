@@ -99,34 +99,118 @@ The bloom filter derives its k probe positions by double hashing over CRC-32
 and FNV-1a of the key. It can only err towards "maybe present" — never towards
 "absent" for a key that was written.
 
-### MANIFEST
+### MANIFEST — format v2
 
-A small text file (`next-sst-id`, `wal-gen`, one `sst <id>` line per live
-table), replaced atomically: write `MANIFEST.tmp`, fsync, rename over the old
-file. A crash therefore leaves the old or the new manifest, never a torn one.
-Files present on disk but not named by the manifest are orphans of interrupted
-operations and are deleted on open.
+A small text file, replaced atomically: write `MANIFEST.tmp`, fsync, rename
+over the old file. A crash therefore leaves the old or the new manifest, never
+a torn one. Files present on disk but not named by the manifest are orphans of
+interrupted operations and are deleted on open.
+
+```
+# LSM storage engine manifest. ...
+format 2
+next-sst-id 7
+wal-gen 3              one line per live WAL generation, oldest first;
+wal-gen 5              the last one is the append target
+pending-flush 3 6      optional, at most one: generation 3 is being
+                       flushed into table 6 (see the flush protocol)
+sst 1                  one line per live table
+sst 2
+```
+
+A **generation list**, rather than a single live generation, because a
+rotation seals one generation and starts the next *before* the sealed one is
+flushed: for the duration of a background flush, two generations hold live
+records, and recovery must replay both, in order. A generation leaves the
+list only at the commit that lands its records in a manifest table.
+
+The **pending-flush slot** names the one flush in flight: the sealed
+generation being written out and the table id reserved for its output. The
+generation stays in the list and the id stays out of `sst` lines until the
+commit, so every crash state the slot can describe has one unambiguous
+recovery (below).
+
+Format v1 (the original layout — no `format` line, exactly one `wal-gen`,
+no pending slot) still loads: it is a one-element generation list. The first
+save after such an open rewrites the file as v2 with identical meaning —
+v1 directories upgrade in place. Cross-field invariants the writer maintains
+(generations strictly increasing; the pending generation listed, sealed —
+never the append target — and its table not yet adopted) are validated on
+load; a manifest violating them was not produced by a crash of this engine
+and opening refuses with `StorageCorruptionException`.
 
 ## Flush protocol
 
-Flushing is synchronous, under the write lock (see *Deviations* below). The
-order of steps is chosen so every crash window recovers correctly:
+Flushing is a **background** operation in three phases. Rotation is instant
+and happens under the write lock; the table write runs on a worker thread;
+the commit takes the write lock briefly.
 
-1. Write the memtable's entries to `sst-<id>.tmp`, fsync, rename to
-   `sst-<id>.lsm`. (Not yet in the manifest: a crash here leaves an orphan
-   file; the WAL still holds every record.)
-2. Create the *next* WAL generation file.
-3. Update the manifest: add the table, advance the WAL generation, fsync via
-   the atomic rename. (A crash before this completes is step 1's case; after
-   it, the table is live and the old WAL is an orphan.)
-4. Switch the live WAL to the new generation; delete the old WAL file.
+**Rotation** (triggered when the memtable crosses its size threshold, or by
+`Flush()`):
 
-At no point can a record exist only in a file the manifest disowns.
+1. Create the *next* WAL generation's file and fsync it — before the
+   manifest names it.
+2. Save the manifest: the new generation joins the list as the append
+   target, the sealed generation stays listed and gains the pending-flush
+   slot with a reserved table id, and `next-sst-id` advances past it. (If
+   this save fails, the rotation rolls back in memory and the caller sees
+   the exception; nothing rotated.)
+3. Rotate in memory: the live memtable freezes as the *pending memtable*,
+   a fresh memtable and the new WAL take over, and the worker starts.
+   Writes never wait for the table write.
+
+**Worker** (no locks): stream the frozen entries to `sst-<id>.tmp`, fsync,
+rename to `sst-<id>.lsm`.
+
+**Commit** (write lock, briefly):
+
+4. Save the manifest: adopt the table, clear the pending slot, and retire
+   every generation the flushed memtable covered — the sealed one, plus any
+   older generations recovery had replayed into the same memtable.
+5. Delete the retired generations' WAL files, open the table for reads,
+   drop the pending memtable, and run the table-count compaction check.
+6. If a flush was requested during the flight, or the live memtable
+   already crossed its threshold again, chain the next rotation *before*
+   reporting the pipeline idle — a caller waiting for the flush to settle
+   never observes a false idle.
+
+**Crash windows** — every state a crash can leave, and its recovery:
+
+| Window | On-disk state | Recovery |
+|---|---|---|
+| Before the rotation save | Old manifest; the new WAL file exists empty, unlisted | File is an orphan, deleted; the old generation replays. Nothing rotated, nothing lost. |
+| After rotation, before the table write | Pending slot set; both generations listed; no table file | Pending flush discarded: both generations replay; the slot is cleared and the resolution saved. |
+| Mid-write | Pending slot set; `sst-<id>.tmp` partial | Temp file deleted as an orphan; generations replay. |
+| After the rename, before the commit save | Pending slot set; `sst-<id>.lsm` complete but unlisted | Table deleted **unread** as an orphan; generations replay. (Recovery never adopts a table the manifest did not adopt — the WAL is the record.) |
+| After the commit save, before WAL deletion | Table adopted; slot cleared; retired WAL files still present, now unlisted | Files deleted unread as orphans; the table serves the data. |
+
+At no point can a record exist only in a file the manifest disowns, and at
+every instant an acknowledged write is durable in exactly one place: the
+current generation's WAL, a sealed generation's WAL, or its table.
+
+**Flush failure.** If the worker's write or the commit throws (disk full,
+I/O error), nothing durable changes: the generation stays listed, the slot
+stays set, its WAL is untouched, and the frozen memtable stays in the read
+path. The failure is recorded and the semantics are: **reads keep working;
+writes throw** an `InvalidOperationException` naming the original failure,
+until `Flush()` retries the same job (same generation, same reserved table
+id) to completion, or the instance is disposed — a reopen recovers every
+acknowledged write from the WALs either way. A failed generation is never
+silently dropped, and a retry never renumbers anything.
 
 ## Recovery
 
-On open, after loading the manifest and the tables, the live WAL generation is
-replayed record by record into a fresh memtable, using each frame's CRC-32.
+On open, after loading the manifest and the tables, **every live WAL
+generation is replayed, oldest first**, into a fresh memtable, using each
+frame's CRC-32. (A generation's records are never also in a manifest table —
+it leaves the list only at the commit that adopts its table — so replay
+cannot double-apply a flush. A pending flush is resolved by the discard
+rule in the table above, and the resolution is saved.) A WAL file the
+manifest lists but disk does not have is loud `StorageCorruptionException`:
+like a missing table, it held the only durable copy of acknowledged writes,
+and opening must refuse rather than replay nothing and call the loss a
+fresh database.
+
 Two kinds of damage are possible at the tail, and they are treated oppositely:
 
 * **Torn tail** — a crash mid-append leaves a partial final record, or a final
@@ -201,7 +285,21 @@ before a compaction keeps reading its consistent view.
 * One process per directory, enforced by an OS file lock (`LOCK`).
 * Inside the process: a reader/writer lock. Any number of concurrent readers;
   one writer at a time. Writes are serialized — there is no lock-free path.
-* Scans are snapshots: the source list (a memtable entry copy + the table
+* Read order is: live memtable, then the pending (frozen) memtable while a
+  flush is in flight, then tables newest-first. Reads never wait for the
+  flush thread.
+* The flush pipeline has explicit rendezvous points instead of lock-step
+  coupling: `Flush()` returns only when the flush it started or requested —
+  including a rotation chained from an in-flight commit — has committed;
+  `Compact()` and the `TableCount` getter first wait for the pipeline to
+  settle; `Dispose()` waits for the in-flight job to commit before tearing
+  down. Waiting never happens while holding the database lock, and the
+  worker needs only the write lock briefly at commit, so none of these can
+  deadlock it. If the memtable crosses its threshold while a flush is in
+  flight, it simply keeps growing until that flush's commit chains the
+  next rotation — backpressure is growth bounded by flush speed, never a
+  blocked writer.
+* Scans are snapshots: the source list (memtable entry copies + the table
   readers) is captured under the read lock at `Scan()` call time, and the
   merge runs lock-free over immutable data afterwards. Later writes are
   invisible to the scan; later deletes do not hide its rows.
@@ -230,6 +328,11 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
 * No acknowledged write is ever silently corrupted or half-applied: damage is
   either a truncated torn tail (data after the last valid record was never
   acknowledged) or a loud `StorageCorruptionException` at open.
+* Across a flush — synchronous observation or background flight — an
+  acknowledged write is durable in exactly one place at every instant: the
+  live WAL generation, one sealed generation's WAL, or its table. A failed
+  background flush changes none of that (see *Flush failure* above): it can
+  suspend writes, never lose them.
 * A clean `Dispose()` fsyncs, so a dispose/reopen cycle loses nothing under
   either policy.
 * Deletes are writes: a tombstone is as durable as the value it removes.
@@ -245,40 +348,27 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
 
 ## Deviations from a textbook LSM, on purpose
 
-* **No immutable-memtable queue (background flush — evaluated, not adopted).**
-  Textbook designs rotate the memtable to an immutable one and flush it on a
-  background thread so writes never stall. Here the flush happens
-  synchronously under the write lock. With a 4 MB default memtable the stall
-  is a few milliseconds, and in exchange an entire class of races (flush
-  failing in the background, reads spanning three memtable generations, WAL
-  generation bookkeeping across rotations) does not exist. Read order is
-  simply: memtable, then tables.
-
-  This was re-evaluated in the hardening pass, and the evaluation is recorded
-  here because it is a decision, not an oversight. Rotation forces the live
-  WAL to switch to a new generation *immediately* — new writes cannot wait
-  for the background flush — while the rotated generation's records are not
-  yet durable anywhere but that generation's WAL file. So for the whole
-  duration of a background flush, **two** WAL generations are live, and a
-  crash must replay both, in order. The manifest names exactly one live
-  generation, and the flush protocol's crash windows (above) are all stated
-  against that fact: with a single-generation manifest, recovery from a
-  mid-rotation crash would treat one of the two live generations as an
-  orphan and delete it — losing acknowledged writes, or resurrecting flushed
-  ones. A safe background flush therefore needs a manifest format change
-  first (a generation list plus a pending-flush table slot) and a new
-  recovery matrix for the states it creates. Two further obstacles stand
-  behind that one: a background flush can fail (disk full, I/O error) with
-  no caller to throw to — every write it covers was already acknowledged
-  against the WAL — so the engine would need a poisoned-state semantic the
-  current contract does not have; and clean shutdown and the crash test hook
-  would both have to rendezvous with the flush thread, so a flush completing
-  concurrently could not swap tables or save the manifest into an instance
-  that is already logically dead. The benefit on offer — removing a
-  few-millisecond stall at the default memtable size — does not pay for
-  re-opening the recovery proof. The prerequisite for any future attempt is
-  named: the manifest format change, with its own crash-state tests written
-  before the rotation itself.
+* **Background flush — adopted, on the prerequisite the earlier evaluation
+  named.** The first hardening pass evaluated the textbook design (rotate
+  the memtable, flush it on a background thread) and rejected it *at that
+  time*, for one structural reason: rotation makes two WAL generations
+  live at once, and the single-generation manifest could not express that
+  — a mid-rotation crash would have orphaned a live generation. The
+  evaluation named its prerequisite exactly: a manifest format change (a
+  generation list plus a pending-flush slot) with its own crash-state
+  tests written before the rotation itself. That is the order this pass
+  followed: format v2 landed first with a hand-built crash-state matrix
+  for every state the new fields can describe; the rotation was then built
+  on top, and each of the evaluation's remaining obstacles got a stated
+  answer — background failure has defined semantics (reads continue,
+  writes suspend loudly, `Flush()` retries the identical job; see the
+  flush protocol), and `Dispose`/`SimulateCrash` rendezvous with or
+  abandon the worker explicitly, with checkpoints that keep a surviving
+  worker from touching the directory after a crash. The queue depth is
+  one: a single pending slot, matching the single slot in the format. The
+  synchronous flush's one real virtue — the state space stayed tiny — is
+  what the v2 crash matrix had to re-prove at the larger size; the suite
+  counts are in the README's Tests section.
 * **Full-merge compaction** instead of leveled compaction (see above).
 * **Directory fsyncs are not issued** after renames or file creations; file
   fsyncs are. The distinction matters: fsyncing a record makes its *bytes*
