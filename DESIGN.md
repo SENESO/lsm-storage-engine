@@ -8,7 +8,7 @@ precisely — what is and is not guaranteed.
 ## Architecture
 
 ```
-                Put / Delete / Write(batch)
+          Put / Delete / DeleteRange / Write(batch)
                           │
                           ▼
               ┌───────────────────────┐        fsync policy
@@ -24,13 +24,13 @@ precisely — what is and is not guaranteed.
                           ▼
               ┌───────────────────────┐
               │  SSTable  sst-*.lsm   │  immutable, sorted, sparse index
-              │  + bloom filter       │  + bloom filter
+              │  + bloom filter       │  + bloom filter + range index
               └───────────┬───────────┘
-              table count ≥ threshold
+              strategy trigger (see Compaction)
                           ▼
               ┌───────────────────────┐
-              │      Compaction       │  full merge: newest wins,
-              │                       │  tombstones purged
+              │      Compaction       │  tiered: full merge, or
+              │                       │  leveled: incremental, by level
               └───────────────────────┘
 
   MANIFEST — the atomic source of truth for which files are live.
@@ -41,22 +41,31 @@ precisely — what is and is not guaranteed.
 the WAL and flush per policy → apply to the memtable → flush the memtable if it
 crossed its size threshold.
 
-**Read path.** Memtable → SSTables newest-first. An SSTable read checks the
-key range, then the bloom filter, then binary-searches the sparse index and
-scans forward at most `IndexSampleInterval` entries.
+**Read path.** Memtable → SSTables newest-first, where "newest" is level
+ascending, then table id descending (under the tiered strategy every table is
+level 0, so this is simply newest table first). A lookup resolves the first
+layer that has a verdict for the key — a value, a point tombstone, or a range
+tombstone covering it — and a value whose TTL deadline has passed counts as
+absent at its own layer and shadows everything beneath it. An SSTable read
+checks the key range, then the bloom filter, then binary-searches the sparse
+index and scans forward at most `IndexSampleInterval` entries; range coverage
+is answered from a dedicated ranges section, not by scanning data.
 
-**Memtable choice.** A `SortedDictionary` (red-black tree) with a byte-wise
-comparer, rather than a skip list. The engine has a single writer and guards
-the memtable with the database lock, so the skip list's one advantage —
-lock-free concurrent mutation — buys nothing here. The tree gives deterministic
-O(log n) operations, in-order enumeration for flushes and scans for free, and
-no probabilistic edge cases. Entry size accounting is approximate: key + value
-bytes + a fixed 48-byte per-entry overhead estimate.
+**Memtable choice.** A `SortedDictionary` (red-black tree) ordered by the
+database's key comparer (byte-wise by default), rather than a skip list. The
+engine has a single writer and guards the memtable with the database lock, so
+the skip list's one advantage — lock-free concurrent mutation — buys nothing
+here. The tree gives deterministic O(log n) operations, in-order enumeration
+for flushes and scans for free, and no probabilistic edge cases. Entry size
+accounting is approximate: key + value bytes + a fixed 48-byte per-entry
+overhead estimate.
 
 ## File formats
 
 All integers are little-endian. Keys and values are raw byte arrays; ordering
-is unsigned lexicographic byte order.
+is the database's key comparer — unsigned lexicographic byte order unless a
+custom comparer was supplied at creation (see *Ordering, expiry, and range
+deletes*).
 
 ### WAL — `wal-<generation>.log`
 
@@ -69,35 +78,66 @@ A sequence of record frames:
 Payload layouts:
 
 ```
-Put:    [0x01][keyLen int32][key][valueLen int32][value]
-Delete: [0x02][keyLen int32][key]
-Batch:  [0x03][opCount int32] then per op:
-          [opType byte 0x01|0x02][keyLen int32][key]
-          (+ [valueLen int32][value] for Put ops)
+Put:           [0x01][keyLen int32][key][valueLen int32][value]
+Delete:        [0x02][keyLen int32][key]
+Batch:         [0x03][opCount int32] then per op (below)
+PutWithExpiry: [0x04][keyLen int32][key][expiresAtMs int64][valueLen int32][value]
+RangeDelete:   [0x05][startLen int32][start][endLen int32][end]
 ```
+
+A batch's ops use the same per-op layouts, prefixed by their type byte
+(0x01, 0x02, 0x04, or 0x05); a batch put-with-TTL is encoded as 0x04 with the
+*absolute* deadline — the engine converts the caller's relative TTL against
+its clock when the batch is written, so replay never depends on when it runs.
+Deadlines are unix milliseconds. The 0x01/0x02 layouts are byte-identical to
+the original format: a WAL written by the previous generation decodes exactly
+as it did then.
 
 A batch is a *single* record, so the frame CRC makes it atomic: recovery
 applies the whole batch or none of it.
 
-### SSTable — `sst-<id>.lsm`
+### SSTable — `sst-<id>.lsm` (format v2)
 
 ```
-Data section — entries in ascending key order:
-  [keyLen int32][key][flags byte: 0 = value, 1 = tombstone]
-  [valueLen int32][value]                      (omitted for tombstones)
+Data section — entries in ascending key order (a range tombstone sorts at
+its start key, after a point entry with the same key):
+  [keyLen int32][key][flags byte: 0 = value, 1 = tombstone,
+                                2 = value with expiry, 3 = range tombstone]
+  [expiresAtMs int64]                          (flag 2 only)
+  [valueLen int32][value]                      (flags 0 and 2)
+  [endLen int32][end]                          (flag 3 only: the range end)
 Index section — sparse index:
   [keyLen int32][key][dataOffset int64]        one per sampled entry
                                                (entry 0 always; the last entry always)
 Bloom section:
   [hashCount int32][bit bytes]                 ~10 bits/key by default
-Footer — fixed 32 bytes at end of file:
+Ranges section — the table's range tombstones, normalized to disjoint,
+start-sorted intervals (overlaps merged by the writer):
+  [count int32] then per interval: [startLen int32][start][endLen int32][end]
+Footer — fixed 40 bytes at end of file:
   [indexOffset int64][bloomOffset int64][bloomLength int32]
-  [entryCount int32][magic 8 bytes "LSMDB001"]
+  [entryCount int32][rangeOffset int64][magic 8 bytes "LSMDB002"]
 ```
+
+The ranges section exists so a point lookup can answer "does a range
+tombstone here cover this key?" in O(log n) without scanning the data
+section; the flag-3 entries in the data section are what scans and merges
+consume, and the two are written from the same source list.
 
 The bloom filter derives its k probe positions by double hashing over CRC-32
 and FNV-1a of the key. It can only err towards "maybe present" — never towards
-"absent" for a key that was written.
+"absent" for a key that was written. It is keyed on exact key bytes, so it is
+consulted only under the built-in byte ordering: a custom comparer may equate
+distinct byte strings (a case-insensitive ordering does), and under one, a
+bloom miss would not prove absence — the index walk alone decides there.
+
+**Format v1 tables still load.** The previous generation's layout (flags 0/1
+only, no ranges section, fixed 32-byte footer, magic "LSMDB001") is read by
+the same reader — a directory can hold both generations, and merges consume
+v1 tables through the same entry stream as v2. Nothing is rewritten eagerly;
+a v1 table leaves the directory when a merge retires it, like any other
+table. The test suite builds a v1 file byte-for-byte to the old spec and
+reads it back.
 
 ### MANIFEST — format v2
 
@@ -109,14 +149,30 @@ interrupted operations and are deleted on open.
 ```
 # LSM storage engine manifest. ...
 format 2
+comparator bytewise    the recorded key-comparer identity (see below)
 next-sst-id 7
 wal-gen 3              one line per live WAL generation, oldest first;
 wal-gen 5              the last one is the append target
 pending-flush 3 6      optional, at most one: generation 3 is being
                        flushed into table 6 (see the flush protocol)
-sst 1                  one line per live table
-sst 2
+sst 1 0                one line per live table: id, then compaction level
+sst 2 1                (the level field may be absent in older files = 0)
 ```
+
+Two grammar extensions ride on the v2 format without bumping it, because
+both degrade safely in the direction that matters. The `sst` level field is
+absent from manifests written before levels existed and parses as level 0 —
+exactly right, since the tiered strategy treats every table as level 0
+anyway. The `comparator` line records the name the database's key comparer
+was opened with (`bytewise` for the built-in ordering, including every
+directory created before comparers existed — a missing line means
+`bytewise`). Opening a directory whose recorded name differs from the name
+supplied in `StorageOptions` is refused with `InvalidOperationException`
+before anything is read or written: every sorted structure on disk is laid
+out under the recorded ordering, and interpreting it under another would
+silently corrupt reads. The refusal compares *names*, deliberately — the
+engine cannot verify that two comparer objects with the same name order
+identically, so the name is the contract the embedder owns.
 
 A **generation list**, rather than a single live generation, because a
 rotation seals one generation and starts the next *before* the sealed one is
@@ -228,16 +284,138 @@ exactly at end-of-file. If such a chain exists, the damage is mid-log. (The
 scan is O(file²) in the worst case — acceptable for a WAL, which is bounded by
 the memtable threshold plus one batch.)
 
+## Ordering, expiry, and range deletes
+
+**Custom comparators.** `StorageOptions.KeyComparer` replaces the key
+ordering everywhere — memtable, tables, merges, scans, range operations —
+and `KeyComparerName` gives that ordering an identity, recorded in the
+manifest (the open-time refusal on a mismatch is described under *MANIFEST*).
+The built-in default is unsigned lexicographic byte order, name `bytewise`.
+Two consequences are worth stating. First, equality is the comparer's: under
+a case-insensitive comparer, `User:42` and `USER:42` are the same key for
+puts, gets, and deletes alike. Second, the per-table bloom filter is keyed on
+exact bytes and is therefore consulted only under the built-in ordering (see
+*SSTable*) — correctness under a custom comparer never depends on the
+comparer's relationship to byte equality.
+
+**Per-key TTL.** `Put(key, value, ttl)` and `Expire(key, ttl)` attach an
+absolute deadline — unix milliseconds, computed from the database clock at
+write time — that is persisted with the value through the WAL (record 0x04),
+the memtable, and the tables (entry flag 2), and so survives crash and
+reopen with the original deadline. The clock is `StorageOptions.Clock`,
+defaulting to the system clock; tests substitute a manually advanced clock,
+so no test ever sleeps. Semantics:
+
+* Expiry is **lazy and exact**: a `Get` or scan at or after the deadline
+  sees the key as absent. No background sweeper exists; an expired value's
+  bytes are reclaimed when its layer is next written (flush or merge).
+* An expired newest version **shadows** older copies exactly like a
+  tombstone does — expiry never resurrects an older value.
+* A plain `Put` clears any deadline; a later `Put` with a TTL replaces it.
+  `Expire` on a missing or already-expired key returns `false` and writes
+  nothing. `Delete` on an expired value likewise writes nothing.
+* At flush, a value already expired converts to a point tombstone (the
+  shadow must survive; the bytes need not). At a bottom merge — a tiered
+  full merge, or a leveled merge whose drop test passes — expired values
+  and their shadows are dropped entirely.
+
+**Range deletes.** `DeleteRange(start, end)` writes one range tombstone for
+the half-open span `[start, end)` (in comparer order; an empty span is a
+no-op that writes nothing, a reversed span is an argument error). It is a
+first-class write with the same guarantees as a point tombstone: one WAL
+record (0x05, or one op inside a batch, applied in batch order), durable
+before the call returns, flowing memtable → flush → compaction. Inside the
+memtable it also removes covered point entries physically — they can never
+be observed again — while the tombstone itself is kept to shadow older
+layers. In a table it is stored twice from one source: as data entries for
+scans and merges, and as normalized intervals in the ranges section for
+point lookups. During a merge, a range tombstone from a newer input
+suppresses covered point entries from older inputs; entries from its own
+input are never suppressed by it (application order within one layer was
+already resolved when that layer was written). A put inside a deleted span,
+at any later time and in any newer layer, is unaffected — the tombstone
+shadows only what is older than it.
+
 ## Compaction
+
+Two strategies, selected at open by `StorageOptions.CompactionStrategy`.
+Both consume and produce the same table format through the same streaming
+k-way merge; they differ in *which* tables a merge takes as inputs and in
+when a tombstone may be dropped. A directory may switch strategies between
+opens — levels are manifest metadata, and reads order tables level-then-id
+under either strategy.
+
+### Tiered (the default)
 
 Trigger: after a flush, when the live table count reaches
 `CompactionTableThreshold` (also callable directly via `Compact()`).
 
 Policy: size-tiered in spirit — tables accumulate as a tier of flush outputs,
-and the merge is a **full merge of every live table** into one, rather than a
-leveled design's incremental merges. That trades write amplification (every
-compaction rewrites all data) for a much simpler correctness story, which is
-the right trade at this scale.
+and the merge is a **full merge of every live table** into one. That trades
+write amplification (every compaction rewrites all data) for a much simpler
+correctness story, which is the right trade at small scale — and the reason
+it stays the default.
+
+During the merge:
+
+* for duplicate keys, the newest table's version wins;
+* overwritten entries are dropped;
+* **tombstones are purged.** This is safe *because* the merge spans every
+  table: there is no older copy of any key beneath the merge for a tombstone
+  to shadow. (The memtable is newer than every table and is not part of the
+  merge.) Every tiered merge is a bottom merge: point tombstones, range
+  tombstones, and expired values all leave the database here.
+
+### Leveled
+
+Flush outputs land in level 0. A *settle* pass — run at every flush commit
+and by `Compact()` — repeats merges until nothing is owed:
+
+* **L0 drain:** when level 0 holds at least `CompactionTableThreshold`
+  tables, all of them merge into level 1, together with every level-1 table
+  whose span they touch.
+* **Level step:** the first level L ≥ 1 whose total size exceeds its budget
+  — `LeveledBaseLevelSizeBytes × LeveledSizeRatio^(L−1)` — contributes its
+  smallest-starting-key table, plus every level-(L+1) table whose span it
+  touches, to a merge into level L+1.
+
+Because every merge into a level includes all overlapping tables already
+there, **each level above 0 is key-range partitioned**: its tables never
+overlap, so a point read consults at most one table per level. Outputs are
+split at `LeveledTargetTableSizeBytes`. The manifest swap that adopts a
+merge's outputs is a single save, with the same crash windows as the tiered
+merge (outputs are orphans before it, inputs are orphans after it).
+
+**Tombstone discipline** is the leveled difference, and it is a proof
+obligation per merge, not a level number: a point tombstone (or an expired
+value, which behaves as one) for key K may be dropped only if no live table
+*outside the merge's inputs* has a span that could contain K; a range
+tombstone for `[s, e)` may be dropped only if no outside table's span
+intersects it. Anything not provably droppable is carried into the output
+(an expired value is carried as a point tombstone — same shadow, no value
+bytes). Resurrection is therefore impossible by construction: a tombstone
+outlives every copy it could shadow, and disappears only in a merge that
+contains them all. The suite proves both directions — retention with an
+older copy pinned in a non-input table below, and the drop once a merge
+includes that table.
+
+**Measured amplification**, on the suite's fixed workload (400 keys,
+~210-byte values, ~85 KB live set; initial load, then 12 rounds each
+rewriting a tenth of the keys, with a flush and a `Compact()` per round;
+counted by the engine's own SSTable-bytes-written counter, same machine and
+build as the README benchmarks):
+
+| Strategy | SSTable bytes written | vs live set |
+|---|---|---|
+| Tiered (full merge per round) | 1,373,116 | ~16× |
+| Leveled (base 16 KB, ratio 4, target 16 KB) | 744,822 | ~9× |
+
+Leveled writes roughly half the bytes here — the expected direction, since
+a round's small update batch no longer drags the whole live set through a
+merge — at the cost of the partitioning and tombstone bookkeeping above,
+and of more live tables at rest (8 vs 1 at the end of this workload).
+
+### The merge itself (both strategies)
 
 The merge **streams end to end**: a k-way merge holds one entry per input
 table, and each surviving entry is written straight into the output table
@@ -250,16 +428,6 @@ seen is the bloom filter's size; it is sized from the inputs' combined entry
 count, a strict upper bound on the merged count, since duplicates and
 tombstones only shrink it. A merged table may therefore carry a somewhat
 larger filter than an exact count would give — never a smaller one.)
-
-During the merge:
-
-* for duplicate keys, the newest table's version wins;
-* overwritten entries are dropped;
-* **tombstones are purged.** This is safe *because* the merge spans every
-  table: there is no older copy of any key beneath the merge for a tombstone
-  to shadow. (The memtable is newer than every table and is not part of the
-  merge.) In a leveled design, tombstones may only be dropped at the last
-  level; here every merge is a last-level merge.
 
 Evidence for the streaming bound, measured in the hardening run (shared
 sandbox VM, Release build, warm page cache — indicative, like the README
@@ -335,7 +503,13 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
   suspend writes, never lose them.
 * A clean `Dispose()` fsyncs, so a dispose/reopen cycle loses nothing under
   either policy.
-* Deletes are writes: a tombstone is as durable as the value it removes.
+* Deletes are writes: a tombstone is as durable as the value it removes —
+  and a range delete is one tombstone write with the same standing, not a
+  per-key loop.
+* Expiry is not a durability event: a TTL deadline is an absolute timestamp
+  persisted with the value, so a crash and a long downtime change nothing
+  about when a key expires — a value whose deadline passed while the
+  process was down is simply absent on the next read.
 * One platform-qualified edge stands next to this list, stated in full under
   *Deviations*: fsync makes a record's **bytes** durable; the **directory
   entry** naming its file follows the filesystem's metadata rules. On NTFS,
@@ -369,7 +543,16 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
   synchronous flush's one real virtue — the state space stayed tiny — is
   what the v2 crash matrix had to re-prove at the larger size; the suite
   counts are in the README's Tests section.
-* **Full-merge compaction** instead of leveled compaction (see above).
+* **Full-merge compaction is the default**, with leveled compaction as an
+  opt-in strategy rather than the only design (see *Compaction*). The
+  textbook (LevelDB-style) answer makes leveled the design and pays its
+  complexity always; here the simple correctness story — every merge is a
+  bottom merge, tombstones purge unconditionally — stays the default, and
+  the leveled machinery (partitioned levels, per-merge tombstone proof
+  obligations) is carried only by embedders who select it for the write
+  amplification. The two share the merge, the formats, and the crash
+  protocol; the measured difference on the reference workload is in the
+  Compaction section.
 * **Directory fsyncs are not issued** after renames or file creations; file
   fsyncs are. The distinction matters: fsyncing a record makes its *bytes*
   durable, while the *name* — the directory entry a WAL file is created
@@ -412,13 +595,22 @@ A write is *acknowledged* when `Put`/`Delete`/`Write` returns.
 
 ## Limitations
 
-* Byte-array keys and values only; no comparators, no column families, no TTL.
+* Byte-array keys and values only; no column families — keys that need
+  grouping carry their group in the key bytes (a prefix), as in the systems
+  this design follows. This is the one capability gap the design records
+  without a scheduled direction: nothing in the formats forbids it, and no
+  part of the roadmap depends on it.
 * No transactions beyond single-batch atomicity (no read-your-writes isolation
   levels, no multi-batch rollback).
 * Single writer process; no network interface — this is an embeddable library.
-* Compaction streams (see above), but it is still a *full* merge: every
-  compaction rewrites every live byte, so write amplification — not memory —
-  is the cost that grows with data size. A leveled design is the named next
-  step if that ever matters more than the simple correctness story.
+* The default (tiered) compaction is still a *full* merge: every compaction
+  rewrites every live byte, so write amplification — not memory — is the
+  cost that grows with data size. The leveled strategy exists for exactly
+  that cost (see *Compaction* for the measured comparison); it is a
+  strategy choice at open, not a free upgrade — it keeps more tables at
+  rest and carries tombstones longer by design.
+* Expiry is lazy: an expired value's bytes are reclaimed only when its
+  layer is next written, so disk usage can temporarily include dead values
+  (reads never see them).
 * Values are returned as copies from `Get`; `Put` takes ownership of the
   arrays it is given (mutating them afterwards is a caller bug).
