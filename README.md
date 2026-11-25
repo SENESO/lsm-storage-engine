@@ -1,5 +1,7 @@
 # LSM Storage Engine in C#
 
+[![ci](https://github.com/SENESO/lsm-storage-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/SENESO/lsm-storage-engine/actions/workflows/ci.yml)
+
 A from-scratch log-structured merge-tree (LSM) key-value storage engine in C# on .NET 8 — write-ahead log with CRC-32 integrity, sorted in-memory memtable, immutable SSTables with sparse indexes and bloom filters, and a choice of full-merge (tiered) or leveled compaction. Byte-array keys and values, per-key TTL, range deletes, custom key comparators, an atomic batch write, snapshot scans, and durability guarantees that are stated precisely and tested by simulating crashes.
 
 The library has **zero package dependencies** — the CRC-32, the bloom filter, and every file format are implemented by hand.
